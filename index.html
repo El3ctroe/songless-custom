@@ -24,10 +24,14 @@ button.icon{padding:8px 12px}
 input[type=text]{width:100%;font:inherit;color:var(--text);background:#0f1217;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 input[type=text]:focus{outline:none;border-color:var(--acc)}
 .meta{display:flex;justify-content:space-between;margin-bottom:14px}
-.segs{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:16px}
-.seg{height:40px;border-radius:8px;background:#12151a;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--mut)}
-.seg.on{background:rgba(30,215,96,.14);color:var(--text);border-color:rgba(30,215,96,.35)}
-.seg.cur{border-color:var(--acc);color:var(--acc);font-weight:600}
+.bar{display:flex;height:34px;border-radius:999px;overflow:hidden;background:#2b2e2a}
+.bseg{position:relative;background:#2b2e2a;border-right:1px solid rgba(0,0,0,.55)}
+.bseg:last-child{border-right:0}
+.bseg.unlocked{background:#2a7a4f}
+.bseg .fill{position:absolute;top:0;bottom:0;left:0;width:0;background:#21de77}
+.blabels{display:flex;margin:6px 0 16px}
+.blabels span{text-align:right;padding-right:10px;font-size:12px;color:var(--mut)}
+.blabels span.cur{color:var(--acc);font-weight:600}
 .controls{display:flex;gap:10px;margin-bottom:14px}
 .controls .primary{flex:1;padding:14px}
 .guessWrap{position:relative;margin-bottom:14px}
@@ -79,7 +83,7 @@ input[type=range]{width:90px;accent-color:var(--acc)}
 
   <section id="game" class="card" hidden>
     <div class="meta"><span id="plName" class="muted"></span><span id="score" class="muted"></span></div>
-    <div class="segs" id="segs"></div>
+    <div id="barWrap"></div>
     <div class="controls">
       <button class="primary" id="playBtn">▶ Play</button>
       <button id="skipBtn">Skip ⏭</button>
@@ -350,6 +354,7 @@ async function prepare(g) {
 
 /* ---------- Game ---------- */
 let songs = [], queue = [], G = null, clipTimer = null, playing = false, fullPlaying = false, loading = false;
+let clipToken = 0, heard = 0, raf = 0;   // heard = seconds of the bar already "used up" (shown bright when idle)
 let stats = store.get("stats", { rounds: 0, wins: 0 });
 
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
@@ -364,7 +369,7 @@ function setSongs(list) {
 }
 
 async function newRound() {
-  clearTimeout(clipTimer); playing = fullPlaying = false;
+  cancelClip(); fullPlaying = false; heard = 0;
   try { await player.pause(); } catch {}
   const song = pickSong();
   const dur = song.duration_ms || 0;
@@ -379,21 +384,76 @@ async function newRound() {
   if (G.ready) $("#guess").focus();
 }
 
+/* Progress bar: five segments (widths roughly follow the look of the reference), unlocked ones dark green,
+   the part already heard bright green, locked ones grey. */
+const BAR_WEIGHTS = [48, 79, 105, 133, 147];
+function buildBar() {
+  const bar = document.createElement("div"); bar.id = "bar"; bar.className = "bar";
+  const labels = document.createElement("div"); labels.id = "blabels"; labels.className = "blabels";
+  INTERVALS.forEach((n, i) => {
+    const w = BAR_WEIGHTS[i] || 100;
+    const seg = document.createElement("div"); seg.className = "bseg"; seg.style.flex = `${w} 1 0`;
+    const fill = document.createElement("div"); fill.className = "fill"; seg.append(fill); bar.append(seg);
+    const lb = document.createElement("span"); lb.style.flex = `${w} 1 0`; lb.textContent = fmt(n); labels.append(lb);
+  });
+  $("#barWrap").append(bar, labels);
+}
+function drawBar(p) {   // p = seconds of the clip timeline to show as filled
+  let lo = 0;
+  [...$("#bar").children].forEach((el, i) => {
+    const hi = INTERVALS[i];
+    el.firstChild.style.width = Math.max(0, Math.min(1, (p - lo) / (hi - lo))) * 100 + "%";
+    lo = hi;
+  });
+}
+
+function cancelClip() {
+  clipToken++; clearTimeout(clipTimer); cancelAnimationFrame(raf); playing = false;
+}
+
 async function playClip() {
   if (!G || !G.ready || G.over) return;
   const sec = INTERVALS[G.stage];
-  clearTimeout(clipTimer);
-  try {
-    await player.seek(G.startMs);
-    await player.resume();
-  } catch (e) { $("#gameMsg").textContent = "Playback problem: " + e.message; return; }
+  cancelClip();
+  const token = clipToken;
   playing = true; renderPlay();
-  clipTimer = setTimeout(async () => { try { await player.pause(); } catch {} playing = false; renderPlay(); }, sec * 1000);
+  try {
+    await player.pause();          // always start from a clean, paused state
+    await player.seek(G.startMs);
+    // Spotify can drop a resume that comes right after a very short pause, so confirm it started and retry if not.
+    let started = null;
+    for (let i = 0; i < 3 && !started; i++) {
+      const confirmed = waitForState(s => !s.paused, 1200).catch(() => null);
+      await player.resume();
+      started = await confirmed;
+      if (token !== clipToken) return;
+    }
+    if (!started) throw new Error("Spotify didn't start the clip. Press Play again.");
+    // The clip timer starts only once playback is confirmed, so short clips get their full length.
+    const t0 = performance.now();
+    const tick = () => {
+      if (token !== clipToken) return;
+      const p = Math.min(sec, (performance.now() - t0) / 1000);
+      drawBar(p);
+      if (p < sec) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    clipTimer = setTimeout(async () => {
+      if (token !== clipToken) return;
+      try { await player.pause(); } catch {}
+      if (token !== clipToken) return;
+      playing = false; heard = sec; drawBar(heard); renderPlay();
+    }, sec * 1000);
+  } catch (e) {
+    if (token === clipToken) { playing = false; renderPlay(); $("#gameMsg").textContent = e.message; }
+  }
 }
 
 function advance() {
+  cancelClip();
+  player.pause().catch(() => {});
   if (G.stage >= INTERVALS.length - 1) return endRound(false);
-  G.stage++; render(); playClip();
+  G.stage++; heard = INTERVALS[G.stage - 1]; render();   // unlock the next clip; the player presses Play to hear it
 }
 
 function submitGuess(song) {
@@ -414,7 +474,7 @@ function skip() {
 
 async function endRound(won) {
   G.over = true; G.won = won;
-  clearTimeout(clipTimer); playing = false;
+  cancelClip();
   try { await player.pause(); } catch {}
   stats.rounds++; if (won) stats.wins++;
   store.set("stats", stats);
@@ -441,12 +501,9 @@ function renderPlay() {
 
 function render() {
   if (!G) return;
-  const segs = $("#segs");
-  segs.replaceChildren(...INTERVALS.map((n, i) => {
-    const d = document.createElement("div");
-    d.className = "seg" + (i <= G.stage ? " on" : "") + (i === G.stage && !G.over ? " cur" : "");
-    d.textContent = fmt(n); return d;
-  }));
+  [...$("#bar").children].forEach((el, i) => el.classList.toggle("unlocked", i <= G.stage));
+  [...$("#blabels").children].forEach((el, i) => el.classList.toggle("cur", i === G.stage && !G.over));
+  if (!playing) drawBar(G.over ? INTERVALS[G.stage] : heard);
   const h = $("#history");
   h.replaceChildren(...G.guesses.map(g => {
     const li = document.createElement("li");
@@ -595,6 +652,7 @@ $("#guess").addEventListener("keydown", e => {
   else if (e.key === "Escape") hideSuggest();
 });
 
+buildBar();
 boot();
 </script>
 </body>
