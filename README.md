@@ -41,4 +41,4 @@ Alternatively, set `CONFIG.DEFAULT_PLAYLIST` to a playlist link if you'd rather 
 
 - The first clip is 0.1s long, and browser audio has some latency, so very short clips can sound clipped or slightly off. That's a Web Playback SDK limit.
 - Clips start at the beginning of each song. Turn on **random start** in Settings for a harder mode.
-- Songs load muted and pause at the start point so clips begin as quickly as possible.
+- Songs load muted and pause at the start point so clips begin as quickly as possible. hi
