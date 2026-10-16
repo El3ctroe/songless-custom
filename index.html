@@ -341,9 +341,23 @@ async function startPlayback(uri, positionMs) {
   if (!res.ok) throw new Error("Couldn't start playback (error " + res.status + ").");
 }
 
-/* Load the track while muted, park it paused at the start point, so clips begin instantly. */
+/* Spotify sometimes ignores a pause that arrives right after a track starts, so pause, check, and retry.
+   If `token` is given, give up as soon as a newer clip has started so we never pause the wrong thing. */
+async function ensurePaused(token) {
+  for (let i = 0; i < 8; i++) {
+    if (token !== undefined && token !== clipToken) return;
+    try { await player.pause(); } catch {}
+    await sleep(120);
+    if (token !== undefined && token !== clipToken) return;
+    const st = await player.getCurrentState().catch(() => null);
+    if (!st || st.paused) return;
+  }
+}
+
+/* Load the track while muted, park it paused at the start point, so clips begin instantly.
+   Volume stays at 0 until the track is confirmed paused, so nothing audible can leak out. */
 async function prepare(g) {
-  const s = g.song;
+  const s = g.song, tk = clipToken;
   await player.setVolume(0);
   const loaded = waitForState(st => {
     const c = st.track_window.current_track;
@@ -353,8 +367,9 @@ async function prepare(g) {
     await startPlayback(s.uri, g.startMs);
     await loaded.catch(() => {});
   } finally {
-    await player.pause();
-    await player.seek(g.startMs);
+    await ensurePaused(tk);
+    try { await player.seek(g.startMs); } catch {}
+    await ensurePaused(tk);   // a seek can nudge playback back on, so check again
     await player.setVolume(volume());
   }
 }
@@ -377,7 +392,7 @@ function setSongs(list) {
 
 async function newRound() {
   cancelClip(); fullPlaying = false; heard = 0;
-  try { await player.pause(); } catch {}
+  await ensurePaused(clipToken);
   const song = pickSong();
   const dur = song.duration_ms || 0;
   // Start point priority: saved per-song nudge > start_ms in songs.json > global "skip first N seconds" setting.
@@ -451,9 +466,8 @@ async function playClip() {
     raf = requestAnimationFrame(tick);
     clipTimer = setTimeout(async () => {
       if (token !== clipToken) return;
-      try { await player.pause(); } catch {}
-      if (token !== clipToken) return;
       playing = false; heard = sec; drawBar(heard); renderPlay();
+      await ensurePaused(token);   // pauses immediately, then double-checks it really stopped
     }, sec * 1000);
   } catch (e) {
     if (token === clipToken) { playing = false; renderPlay(); $("#gameMsg").textContent = e.message; }
@@ -462,7 +476,7 @@ async function playClip() {
 
 function advance() {
   cancelClip();
-  player.pause().catch(() => {});
+  ensurePaused(clipToken);
   if (G.stage >= INTERVALS.length - 1) return endRound(false);
   G.stage++; heard = INTERVALS[G.stage - 1]; render();   // unlock the next clip; the player presses Play to hear it
 }
@@ -486,7 +500,7 @@ function skip() {
 async function endRound(won) {
   G.over = true; G.won = won;
   cancelClip();
-  try { await player.pause(); } catch {}
+  await ensurePaused(clipToken);
   stats.rounds++; if (won) stats.wins++;
   store.set("stats", stats);
   render();
