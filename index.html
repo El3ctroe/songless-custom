@@ -57,6 +57,7 @@ dialog label{display:block;margin:14px 0 6px;font-size:14px;color:var(--mut)}
 dialog .row{display:flex;gap:8px}
 code{background:#0f1217;padding:2px 6px;border-radius:5px;font-size:13px;word-break:break-all}
 input[type=range]{width:90px;accent-color:var(--acc)}
+input[type=number]{font:inherit;color:var(--text);background:#0f1217;border:1px solid var(--line);border-radius:8px;padding:6px 8px;width:72px}
 </style>
 </head>
 <body>
@@ -103,6 +104,11 @@ input[type=range]{width:90px;accent-color:var(--acc)}
           <button id="fullBtn">▶ Play full song</button>
           <button class="primary" id="nextBtn">Next song →</button>
         </div>
+        <div class="btns">
+          <button id="earlierBtn" title="Silence at the start? Move this song's start time and replay it from there">Start −0.5s</button>
+          <button id="laterBtn" title="Silence at the start? Move this song's start time and replay it from there">Start +0.5s</button>
+        </div>
+        <div class="muted" id="startInfo" style="margin-top:6px"></div>
       </div>
     </div>
     <div class="msg" id="gameMsg"></div>
@@ -119,6 +125,7 @@ input[type=range]{width:90px;accent-color:var(--acc)}
   <div class="row"><input type="text" id="plInput" placeholder="https://open.spotify.com/playlist/…"><button id="plLoad">Load</button></div>
   <div class="row" style="margin-top:8px"><button id="plReset">Use default</button><button id="exportBtn">Export songs.json</button></div>
   <label><input type="checkbox" id="randStart"> Start clips at a random point in the song (harder)</label>
+  <label>Skip the first <input type="number" id="skipSec" min="0" max="30" step="0.5"> seconds of every song (for silent intros). Fix a single song with the Start ± buttons after a round.</label>
   <label>Redirect URI to register in your Spotify app:</label>
   <code id="redirectUri"></code>
   <div class="row" style="margin-top:18px;justify-content:space-between">
@@ -373,7 +380,11 @@ async function newRound() {
   try { await player.pause(); } catch {}
   const song = pickSong();
   const dur = song.duration_ms || 0;
-  const startMs = store.get("randomStart", false) && dur > 45000 ? Math.floor(5000 + Math.random() * (dur - 35000)) : 0;
+  // Start point priority: saved per-song nudge > start_ms in songs.json > global "skip first N seconds" setting.
+  const ov = store.get("startOverrides", {});
+  const base = ov[song.uri] ?? song.start_ms ?? Math.round((store.get("skipSec", 0) || 0) * 1000);
+  const startMs = store.get("randomStart", false) && dur > 45000 && ov[song.uri] == null
+    ? Math.floor(5000 + Math.random() * (dur - 35000)) : base;
   G = { song, startMs, stage: 0, guesses: [], over: false, won: false, ready: false };
   $("#gameMsg").textContent = "";
   $("#guess").value = ""; hideSuggest();
@@ -481,6 +492,18 @@ async function endRound(won) {
   render();
 }
 
+/* Move this song's start time (saved in this browser, and included when you export songs.json), then replay from there. */
+async function nudgeStart(deltaMs) {
+  if (!G || !G.over) return;
+  const ov = store.get("startOverrides", {});
+  G.startMs = Math.max(0, (ov[G.song.uri] ?? G.startMs) + deltaMs);
+  ov[G.song.uri] = G.startMs;
+  store.set("startOverrides", ov);
+  try { await player.seek(G.startMs); await player.resume(); fullPlaying = true; }
+  catch (e) { $("#gameMsg").textContent = e.message; }
+  render();
+}
+
 async function toggleFull() {
   if (!G || !G.over) return;
   try {
@@ -524,6 +547,7 @@ function render() {
     head.textContent = G.won ? `Got it in ${tries} ${tries === 1 ? "guess" : "guesses"}!` : "Out of guesses";
     $("#resTitle").textContent = G.song.name;
     $("#resSub").textContent = G.song.artists.join(", ");
+    $("#startInfo").textContent = G.startMs > 0 ? `Clips start ${(G.startMs / 1000).toFixed(1)}s into this song` : "";
     const art = $("#art"); art.src = G.song.art || ""; art.style.visibility = G.song.art ? "visible" : "hidden";
   }
   renderPlay();
@@ -562,6 +586,7 @@ function openSettings() {
   $("#cidInput").value = store.get("clientId", "");
   $("#plInput").value = store.get("customPlaylist", "") || "";
   $("#randStart").checked = store.get("randomStart", false);
+  $("#skipSec").value = store.get("skipSec", 0) || 0;
   $("#redirectUri").textContent = redirectUri();
   $("#settings").showModal();
 }
@@ -629,6 +654,9 @@ $("#closeSettings").onclick = () => $("#settings").close();
 $("#vol").oninput = e => { store.set("vol", +e.target.value); if (player) player.setVolume(+e.target.value); };
 $("#cidSave").onclick = () => { store.set("clientId", $("#cidInput").value.trim()); toast("Client ID saved"); };
 $("#randStart").onchange = e => store.set("randomStart", e.target.checked);
+$("#skipSec").onchange = e => store.set("skipSec", Math.max(0, Math.min(30, parseFloat(e.target.value) || 0)));
+$("#earlierBtn").onclick = () => nudgeStart(-500);
+$("#laterBtn").onclick = () => nudgeStart(500);
 $("#plLoad").onclick = () => {
   const v = $("#plInput").value.trim();
   if (!parsePlaylistId(v)) { toast("That doesn't look like a playlist link"); return; }
@@ -638,7 +666,7 @@ $("#plReset").onclick = () => { store.del("customPlaylist"); $("#plInput").value
 $("#logoutBtn").onclick = () => { store.del("auth"); location.reload(); };
 $("#exportBtn").onclick = () => {
   if (!songs.length) { toast("Load a playlist first"); return; }
-  const data = { name: $("#plName").textContent.split(" · ")[0], songs: songs.map(({ _k, ...s }) => s) };
+  const data = { name: $("#plName").textContent.split(" · ")[0], songs: songs.map(({ _k, ...s }) => { const o = store.get("startOverrides", {})[s.uri]; return o != null ? { ...s, start_ms: o } : s; }) };
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: "application/json" }));
   a.download = "songs.json"; a.click(); URL.revokeObjectURL(a.href);
