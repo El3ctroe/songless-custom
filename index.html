@@ -125,6 +125,7 @@ input[type=number]{font:inherit;color:var(--text);background:#0f1217;border:1px 
   <div class="row"><input type="text" id="plInput" placeholder="https://open.spotify.com/playlist/…"><button id="plLoad">Load</button></div>
   <div class="row" style="margin-top:8px"><button id="plReset">Use default</button><button id="exportBtn">Export songs.json</button></div>
   <label><input type="checkbox" id="randStart"> Start clips at a random point in the song (harder)</label>
+  <label><input type="checkbox" id="autoWin"> Auto-play the full song after a correct guess</label>
   <label>Skip the first <input type="number" id="skipSec" min="0" max="30" step="0.5"> seconds of every song (for silent intros). Fix a single song with the Start ± buttons after a round.</label>
   <label>Redirect URI to register in your Spotify app:</label>
   <code id="redirectUri"></code>
@@ -498,12 +499,27 @@ function skip() {
 }
 
 async function endRound(won) {
+  const g = G;
   G.over = true; G.won = won;
   cancelClip();
   await ensurePaused(clipToken);
   stats.rounds++; if (won) stats.wins++;
   store.set("stats", stats);
   render();
+  // Correct guess: play the whole song from its start point (can be turned off in Settings).
+  if (won && store.get("autoPlayWin", true) && G === g) {
+    try {
+      await player.seek(g.startMs);
+      let ok = false;
+      for (let i = 0; i < 3 && !ok; i++) {   // Spotify can drop a resume right after a pause, so confirm and retry
+        const confirmed = waitForState(s => !s.paused, 1200).catch(() => null);
+        await player.resume();
+        ok = !!(await confirmed);
+        if (G !== g) return;
+      }
+      if (ok) { fullPlaying = true; renderPlay(); }
+    } catch (e) { $("#gameMsg").textContent = e.message; }
+  }
 }
 
 /* Move this song's start time (saved in this browser, and included when you export songs.json), then replay from there. */
@@ -604,6 +620,7 @@ function openSettings() {
   $("#plInput").value = store.get("customPlaylist", "") || "";
   $("#randStart").checked = store.get("randomStart", false);
   $("#skipSec").value = store.get("skipSec", 0) || 0;
+  $("#autoWin").checked = store.get("autoPlayWin", true);
   $("#redirectUri").textContent = redirectUri();
   $("#settings").showModal();
 }
@@ -671,6 +688,7 @@ $("#closeSettings").onclick = () => $("#settings").close();
 $("#vol").oninput = e => { store.set("vol", +e.target.value); if (player) player.setVolume(+e.target.value); };
 $("#cidSave").onclick = () => { store.set("clientId", $("#cidInput").value.trim()); toast("Client ID saved"); };
 $("#randStart").onchange = e => store.set("randomStart", e.target.checked);
+$("#autoWin").onchange = e => store.set("autoPlayWin", e.target.checked);
 $("#skipSec").onchange = e => store.set("skipSec", Math.max(0, Math.min(30, parseFloat(e.target.value) || 0)));
 $("#earlierBtn").onclick = () => nudgeStart(-500);
 $("#laterBtn").onclick = () => nudgeStart(500);
